@@ -4,9 +4,36 @@ require 'elftools/constants'
 require 'elftools/elf_file'
 require 'elftools/structs'
 require 'elftools/util'
+require 'patchelf/helper'
 require 'fileutils'
 
-require 'patchelf/mm'
+# module ELFTools
+#   module Structs
+#     [ELF32_Phdr, ELF64_Phdr].each do |cls|
+#       refine cls do
+#         include Comparable
+
+#         def <=>(other)
+#           return  1 if other.p_type == ELFTools::Constants::PT_PHDR
+#           return -1 if p_type == ELFTools::Constants::PT_PHDR
+
+#           p_paddr <=> other.p_paddr
+#         end
+#       end
+#     end
+#   end
+# end
+
+module ELFTools
+  module Constants
+    module PF
+      PF_X rescue PF_X = 1
+      PF_W rescue PF_W = 2
+      PF_R rescue PF_R = 4
+    end
+    include PF
+  end
+end
 
 module PatchELF
   # Internal use only.
@@ -14,6 +41,7 @@ module PatchELF
   # For {Patcher} to do patching things and save to file.
   # @private
   class Saver
+    # using ELFTools
     attr_reader :in_file # @return [String] Input filename.
     attr_reader :out_file # @return [String] Output filename.
 
@@ -25,248 +53,260 @@ module PatchELF
       @in_file = in_file
       @out_file = out_file
       @set = set
-      # [{Integer => String}]
-      @inline_patch = {}
-      @elf = ELFTools::ELFFile.new(File.open(in_file))
-      @mm = PatchELF::MM.new(@elf)
-      @strtab_extend_requests = []
-      @append_dyn = []
+      f = File.open(in_file, 'rb+')
+      @buffer = StringIO.new f.read
+      @elf = ELFTools::ELFFile.new(@buffer)
+
+      @section_alignment = @elf.header.e_phoff.num_bytes
+
+      @segments = @elf.segments # usage similar to phdrs
+      @sections = @elf.sections # usage similar to shdrs
+      # {String => String}
+      # section name to its string mapping
+      @replaced_sections = {}
     end
 
     # @return [void]
     def save!
-      # In this method we assume all attributes that should exist do exist.
-      # e.g. DT_INTERP, DT_DYNAMIC. These should have been checked in the patcher.
-      patch_interpreter
-      patch_dynamic
-
-      @mm.dispatch!
+      @set.each { |mtd, _| send :"modify_#{mtd}" }
 
       FileUtils.cp(in_file, out_file) if out_file != in_file
-      patch_out(@out_file)
+      patch_out
       # Let output file have the same permission as input.
       FileUtils.chmod(File.stat(in_file).mode, out_file)
     end
 
     private
 
-    def patch_interpreter
-      return if @set[:interpreter].nil?
+    def page_size
+      PatchELF::Helper::PAGE_SIZE
+    end
 
-      new_interp = @set[:interpreter] + "\x00"
-      old_interp = @elf.segment_by_type(:interp).interp_name + "\x00"
-      return if old_interp == new_interp
+    # size is include NUL byte
+    def replace_section(section, size)
+      s = (@replaced_sections[:section] || @elf.section_by_name(section).data)
+      rs = if s.size < size
+             s.ljust(size, "\x00")
+           else
+             s[0...size] + "\x00"
+           end
+      @replaced_sections[section] = rs
+    end
 
-      # These headers must be found here but not in the proc.
-      seg_header = @elf.segment_by_type(:interp).header
-      sec_header = section_header('.interp')
+    def modify_interpreter
+      @replaced_sections['.interp'] = @set[:interpreter] + "\x00"
+    end
 
-      patch = proc do |off, vaddr|
-        # Register an inline patching
-        inline_patch(off, new_interp)
+    def modify_needed
+      nil
+    end
 
-        # The patching feature of ELFTools
-        seg_header.p_offset = off
-        seg_header.p_vaddr = seg_header.p_paddr = vaddr
-        seg_header.p_filesz = seg_header.p_memsz = new_interp.size
+    def modify_runpath
+      nil
+    end
 
-        if sec_header
-          sec_header.sh_offset = off
-          sec_header.sh_size = new_interp.size
+    def modify_rpath
+      nil
+    end
+
+    def modify_soname
+      nil
+    end
+
+    def with_buf_at(pos)
+      return unless block_given?
+
+      opos = @buffer.tell
+      @buffer.seek pos
+      yield @buffer
+      @buffer.seek opos
+      @buffer
+    end
+
+    def grow_file(newsz)
+      bufsz = @buffer.size
+      return if newsz <= bufsz
+
+      @buffer.truncate newsz
+    end
+
+    def buf_move!(dst_idx, src_idx, n_bytes)
+      with_buf_at(0) do |buf|
+        tmp = buf.read
+        tmp[dst_idx...(dst_idx + n_bytes)] = tmp[src_idx...(src_idx + n_bytes)]
+        buf.truncate 0
+        buf.rewind
+        buf.write buf
+      end
+    end
+
+    def shift_file(extra_pages, start_page)
+      ehdr = @elf.header
+      oldsz = @buffer.size
+      shift = extra_pages * page_size
+      grow_file(oldsz + shift)
+
+      buf_move! shift, 0, oldsz
+      with_buf_at(ehdr.num_bytes) { |buf| buf.write "\x00" * (shift - ehdr.num_bytes) }
+
+      ehdr.e_phoff = ehdr.num_bytes
+      ehdr.e_shoff = ehdr.e_shoff + shift
+      @sections.each { |sec| sec.header.sh_offset += shift }
+      @segments.each do |seg|
+        phdr = seg.header
+        phdr.p_offset += shift
+        phdr.p_align = page_size if phdr.p_align != 0 && (phdr.p_vaddr - phdr.p_offset) % phdr.p_align != 0
+      end
+
+      phdr = ELFTools::Structs::ELF_Phdr[e.elf_class].new(
+        endian: e.endian,
+        p_type: ELFTools::Constants::PT_LOAD,
+        p_offset: 0,
+        p_vaddr: start_page,
+        p_paddr: start_page,
+        p_filesz: shift,
+        p_memsz: shift,
+        p_flags: ELFTools::Constants::PF_R | ELFTools::Constants::PF_W,
+        p_align: page_size
+      )
+      @segments.push ELFTools::Segments::Segments.new(phdr, @buffer)
+    end
+
+    def sort_shdrs
+      rel_syms = [ELFTools::Constants::SHT_REL, ELFTools::Constants::SHT_RELA]
+
+      # Translate sh_link mappings to section names, since sorting the
+      # sections will invalidate the sh_link fields.
+      # similar for sh_info
+      linkage, info = @sections.each_with_object([{}, {}]) do |s, (link, info)|
+        hdr = s.header
+        link[s.name] = @sections[hdr.sh_link].name if hdr.sh_link.nonzero?
+        info[s.name] = @sections[hdr.sh_info].name if hdr.sh_info.nonzero? && rel_syms.include?(hdr.sh_type)
+      end
+      shstrtab_name = @sections[@elf.header.e_shstrndx].name
+      @sections.sort! { |me, you| me.header.sh_offset.to_i <=> you.header.sh_offset.to_i }
+
+      # restore sh_info, sh_link
+      @sections.each do |sec|
+        hdr = sec.header
+        hdr.sh_link = @sections.find_index { |s| s.name == linkage[sec.name] } if hdr.sh_link.nonzero?
+        if hdr.sh_info.nonzero? && rel_syms.include?(hdr.sh_type)
+          info_sec_name = info[sec.name]
+          hdr.sh_info = @sections.find_index { |s| s.name == info_sec_name }
         end
       end
 
-      if new_interp.size <= old_interp.size
-        # easy case
-        patch.call(seg_header.p_offset.to_i, seg_header.p_vaddr.to_i)
+      @elf.header.e_shstrndx = @sections.find_index { |s| s.name == shstrtab_name }
+    end
+
+    def rewrite_sections_executable
+      ehdr = @elf.header
+      sort_shdrs
+      last_replaced = 0
+      @sections.each_with_index { |sec, idx| last_replaced = idx if @replaced_sections[sec.name] }
+      raise PatchELF::PatchError, 'failed, last_replaced + 1 < @sections.size' if last_replaced + 1 >= @sections.size
+
+      last_replaced_hdr = @sections[last_replaced + 1]
+      start_offset = last_replaced_hdr.sh_offset
+      start_addr = last_replaced_hdr.sh_addr
+
+      prev_sec_name = ''
+      @sections.take(last_replaced + 1).each_with_index do |sec, idx|
+        next if idx.zero?
+
+        hdr = sec.header
+        if (sec.type == ELFTools::Constants::SHT_PROGBITS && sec.name != '.interp') || prev_sec_name == '.dynstr'
+          start_addr = hdr.sh_addr
+          start_offset = hdr.sh_offset
+          last_replaced = idx - 1
+          break
+        elsif @replaced_sections[sec.name]
+          replace_section(sec_name, hdr.sh_size)
+        end
+
+        prev_sec_name = sec.name
+      end
+
+      unless start_addr % page_size == start_offset % page_size
+        raise PatchELF::PatchError, 'start_addr /= start_offset (mod PAGE_SIZE)'
+      end
+      first_page = start_addr - start_offset
+
+      if ehdr .e_shoff < start_offset
+        shoff_new = @buffer.size
+        sh_size = ehdr.e_shoff + ehdr.e_shnum * ehdr.e_shentsize
+        grow_file @buffer.size + sh_size
+
+        ehdr.e_shoff = shoff_new
+        raise PatchELF::PatchError, 'ehdr.e_shnum /= @sections.size' unless ehdr.e_shnum == @sections.size
+
+        opos = @buffer.tell
+        @buffer.seek(e_shoff + @sections.first.header.num_bytes) # skip writing to NULL section
+        @sections.each_with_index do |sec, idx|
+          next if idx.zero?
+
+          sec.header.write @buffer
+        end
+        @buffer.seek opos
+      end
+
+      seg_num_bytes = @segments.first.header.num_bytes
+      needed_space = (
+        ehdr.num_bytes +
+        (@segments.count * seg_num_bytes) +
+        @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
+      )
+
+      if needed_space > start_offset
+        needed_space += seg_num_bytes
+        needed_pages = PatchELF::Helper.alignup(needed_space - start_offset, page_size) / page_size
+        raise PatchELF::PatchError, 'virtual address space underrun' if needed_pages * page_size > first_page
+
+        first_page -= needed_pages * page_size
+        start_offset += needed_pages * page_size
+
+        shift_file(needed_pages, first_page)
+      end
+
+      cur_off = ehdr.num_bytes + (@segments.count * seg_num_bytes)
+      with_buf_at(cur_off) { |buf| buf.write "\x00" * (start_offset - cur_off) }
+
+      write_replaced_sections cur_off, first_page, 0
+      raise PatchELF::PatchError, 'cur_off /= needed_space' unless cur_off != needed_space
+
+      rewrite_headers first_page + ehdr.e_phoff
+    end
+
+    def rewrite_headers(phdr_address)
+      nil
+    end
+
+    def write_replaced_sections(cur_off, start_addr, start_offset)
+      nil
+    end
+
+    def rewrite_sections_library
+      nil
+    end
+
+    def rewrite_sections
+      return if @replaced_sections.empty?
+
+      case @elf.elf_type
+      when 'DYN'
+        rewrite_sections_library
+      when 'EXEC'
+        rewrite_sections_executable
       else
-        # hard case, we have to request a new LOAD area
-        @mm.malloc(new_interp.size, &patch)
+        raise PatchELF::PatchError, 'unknown ELF type'
       end
-    end
-
-    def patch_dynamic
-      # We never do inline patching on strtab's string.
-      # 1. Search if there's useful string exists
-      #   - only need header patching
-      # 2. Append a new string to the strtab.
-      #   - register strtab extension
-      dynamic.tags # HACK, force @tags to be defined
-      patch_soname if @set[:soname]
-      patch_runpath if @set[:runpath]
-      patch_runpath(:rpath) if @set[:rpath]
-      patch_needed if @set[:needed]
-      malloc_strtab!
-      expand_dynamic!
-    end
-
-    def patch_soname
-      # The tag must exist.
-      so_tag = dynamic.tag_by_type(:soname)
-      reg_str_table(@set[:soname]) do |idx|
-        so_tag.header.d_val = idx
-      end
-    end
-
-    def patch_runpath(sym = :runpath)
-      tag = dynamic.tag_by_type(sym)
-      tag = tag.nil? ? lazy_dyn(sym) : tag.header
-      reg_str_table(@set[sym]) do |idx|
-        tag.d_val = idx
-      end
-    end
-
-    # To mark a not-using tag
-    IGNORE = ELFTools::Constants::DT_LOOS
-    def patch_needed
-      original_needs = dynamic.tags_by_type(:needed)
-      @set[:needed].uniq!
-      # 3 sets:
-      # 1. in original and in needs - remain unchanged
-      # 2. in original but not in needs - remove
-      # 3. not in original and in needs - append
-      original_needs.each do |n|
-        next if @set[:needed].include?(n.name)
-
-        n.header.d_tag = IGNORE # temporarily mark
-      end
-
-      extra = @set[:needed] - original_needs.map(&:name)
-      original_needs.each do |n|
-        break if extra.empty?
-        next if n.header.d_tag != IGNORE
-
-        n.header.d_tag = ELFTools::Constants::DT_NEEDED
-        reg_str_table(extra.shift) { |idx| n.header.d_val = idx }
-      end
-      return if extra.empty?
-
-      # no spaces, need append
-      extra.each do |name|
-        tag = lazy_dyn(:needed)
-        reg_str_table(name) { |idx| tag.d_val = idx }
-      end
-    end
-
-    # Create a temp tag header.
-    # @return [ELFTools::Structs::ELF_Dyn]
-    def lazy_dyn(sym)
-      ELFTools::Structs::ELF_Dyn.new(endian: @elf.endian).tap do |dyn|
-        @append_dyn << dyn
-        dyn.elf_class = @elf.elf_class
-        dyn.d_tag = ELFTools::Util.to_constant(ELFTools::Constants::DT, sym)
-      end
-    end
-
-    def expand_dynamic!
-      return if @append_dyn.empty?
-
-      dyn_sec = section_header('.dynamic')
-      total = dynamic.tags.map(&:header)
-      # the last must be a null-tag
-      total = total[0..-2] + @append_dyn + [total.last]
-      bytes = total.first.num_bytes * total.size
-      @mm.malloc(bytes) do |off, vaddr|
-        inline_patch(off, total.map(&:to_binary_s).join)
-        dynamic.header.p_offset = off
-        dynamic.header.p_vaddr = dynamic.header.p_paddr = vaddr
-        dynamic.header.p_filesz = dynamic.header.p_memsz = bytes
-        if dyn_sec
-          dyn_sec.sh_offset = off
-          dyn_sec.sh_addr = vaddr
-          dyn_sec.sh_size = bytes
-        end
-      end
-    end
-
-    def malloc_strtab!
-      return if @strtab_extend_requests.empty?
-
-      strtab = dynamic.tag_by_type(:strtab)
-      # Process registered requests
-      need_size = strtab_string.size + @strtab_extend_requests.reduce(0) { |sum, (str, _)| sum + str.size + 1 }
-      dynstr = section_header('.dynstr')
-      @mm.malloc(need_size) do |off, vaddr|
-        new_str = strtab_string + @strtab_extend_requests.map(&:first).join("\x00") + "\x00"
-        inline_patch(off, new_str)
-        cur = strtab_string.size
-        @strtab_extend_requests.each do |str, block|
-          block.call(cur)
-          cur += str.size + 1
-        end
-        # Now patching strtab header
-        strtab.header.d_val = vaddr
-        # We also need to patch dynstr to let readelf have correct output.
-        if dynstr
-          dynstr.sh_size = new_str.size
-          dynstr.sh_offset = off
-          dynstr.sh_addr = vaddr
-        end
-      end
-    end
-
-    # @param [String] str
-    # @yieldparam [Integer] idx
-    # @yieldreturn [void]
-    def reg_str_table(str, &block)
-      idx = strtab_string.index(str + "\x00")
-      # Request string is already exist
-      return yield idx if idx
-
-      # Record the request
-      @strtab_extend_requests << [str, block]
-    end
-
-    def strtab_string
-      return @strtab_string if defined?(@strtab_string)
-
-      # TODO: handle no strtab exists..
-      offset = @elf.offset_from_vma(dynamic.tag_by_type(:strtab).value)
-      # This is a little tricky since no length information is stored in the tag.
-      # We first get the file offset of the string then 'guess' where the end is.
-      @elf.stream.pos = offset
-      @strtab_string = +''
-      loop do
-        c = @elf.stream.read(1)
-        break unless c =~ /\x00|[[:print:]]/
-
-        @strtab_string << c
-      end
-      @strtab_string
-    end
-
-    # This can only be used for patching interpreter's name
-    # or set strings in a malloc-ed area.
-    # i.e. NEVER intend to change the string defined in strtab
-    def inline_patch(off, str)
-      @inline_patch[off] = str
     end
 
     # Modify the out_file according to registered patches.
-    def patch_out(out_file)
-      File.open(out_file, 'r+') do |f|
-        if @mm.extended?
-          original_head = @mm.threshold
-          extra = {}
-          # Copy all data after the second load
-          @elf.stream.pos = original_head
-          extra[original_head + @mm.extend_size] = @elf.stream.read # read to end
-          # zero out the 'gap' we created
-          extra[original_head] = "\x00" * @mm.extend_size
-          extra.each do |pos, str|
-            f.pos = pos
-            f.write(str)
-          end
-        end
-        @elf.patches.each do |pos, str|
-          f.pos = @mm.extended_offset(pos)
-          f.write(str)
-        end
-
-        @inline_patch.each do |pos, str|
-          f.pos = pos
-          f.write(str)
-        end
+    def patch_out
+      File.open(out_file, 'wb+') do |f|
+        @buffer.rewind
+        f.write @buffer.read
       end
     end
 
