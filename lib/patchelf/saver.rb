@@ -235,7 +235,7 @@ module PatchELF
         return  1 if you.header.p_type == pt_phdr
         return -1 if me.header.p_type == pt_phdr
 
-        me.header.p_type.to_i <=> you.header.p_type.to_i
+        me.header.p_paddr.to_i <=> you.header.p_paddr.to_i
       end
     end
 
@@ -258,7 +258,7 @@ module PatchELF
       start_addr = start_replacement_hdr.sh_addr
 
       prev_sec_name = ''
-      (1..(last_replaced + 1)).each do |idx|
+      (1..last_replaced).each do |idx|
         sec = @sections[idx]
         shdr = sec.header
         if (sec.type == ELFTools::Constants::SHT_PROGBITS && sec.name != '.interp') || prev_sec_name == '.dynstr'
@@ -301,7 +301,6 @@ module PatchELF
         (@segments.count * seg_num_bytes) +
         @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
       )
-      PatchELF::Logger.info "needed space is #{needed_space}"
 
       if needed_space > start_offset
         needed_space += seg_num_bytes # new load segment is required
@@ -313,6 +312,8 @@ module PatchELF
 
         shift_file(needed_pages, first_page)
       end
+
+      PatchELF::Logger.info "needed space is #{needed_space}"
 
       cur_off = ehdr.num_bytes + (@segments.count * seg_num_bytes)
       with_buf_at(cur_off) { |buf| buf.write "\x00" * (start_offset - cur_off) }
