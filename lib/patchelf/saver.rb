@@ -82,6 +82,7 @@ module PatchELF
     def save!
       @set.each { |mtd, _| send :"modify_#{mtd}" }
       rewrite_sections
+
       FileUtils.cp(in_file, out_file) if out_file != in_file
       patch_out
       # Let output file have the same permission as input.
@@ -97,7 +98,9 @@ module PatchELF
     # size is include NUL byte
     def replace_section(section, size)
       s = (@replaced_sections[section] || @sections.find { |sc| sc.name == section }.data)
-      rs = if s.size < size
+      rs = if s.size == size
+             s
+           elsif s.size < size
              s.ljust(size, "\x00")
            else
              s[0...size] + "\x00"
@@ -148,7 +151,7 @@ module PatchELF
         tmp[dst_idx...(dst_idx + n_bytes)] = tmp[src_idx...(src_idx + n_bytes)]
         buf.truncate 0
         buf.rewind
-        buf.write buf
+        buf.write tmp
       end
     end
 
@@ -166,6 +169,8 @@ module PatchELF
 
       # shoff = ehdr.e_shoff
       @sections.each_with_index do |sec, i|
+        next if i.zero? # dont touch NULL section
+
         shdr = sec.header
         shdr.sh_offset += shift
         i
@@ -236,19 +241,25 @@ module PatchELF
 
     def rewrite_sections_executable
       ehdr = @elf.header
+      seg_num_bytes = @segments.first.header.num_bytes
       sort_shdrs!
       last_replaced = 0
-      @sections.each_with_index { |sec, idx| last_replaced = idx if @replaced_sections[sec.name] }
-      raise PatchELF::PatchError, 'failed, last_replaced + 1 < @sections.size' if last_replaced + 1 >= @sections.size
 
-      last_replaced_hdr = @sections[last_replaced + 1].header
-      start_offset = last_replaced_hdr.sh_offset
-      start_addr = last_replaced_hdr.sh_addr
+      PatchELF::Logger.info @sections.first.name
+
+      @sections.each_with_index { |sec, idx| last_replaced = idx if @replaced_sections[sec.name] }
+      raise PatchELF::PatchError, 'last_replaced = 0' if last_replaced.zero?
+      raise PatchELF::PatchError, 'last_replaced + 1 >= @sections.size' if last_replaced + 1 >= @sections.size
+
+      PatchELF::Logger.info "last replaced = #{last_replaced}"
+
+      start_replacement_hdr = @sections[last_replaced + 1].header
+      start_offset = start_replacement_hdr.sh_offset
+      start_addr = start_replacement_hdr.sh_addr
 
       prev_sec_name = ''
-      @sections.take(last_replaced + 1).each_with_index do |sec, idx|
-        next if idx.zero?
-
+      (1..(last_replaced + 1)).each do |idx|
+        sec = @sections[idx]
         shdr = sec.header
         if (sec.type == ELFTools::Constants::SHT_PROGBITS && sec.name != '.interp') || prev_sec_name == '.dynstr'
           start_addr = shdr.sh_addr
@@ -256,6 +267,7 @@ module PatchELF
           last_replaced = idx - 1
           break
         elsif @replaced_sections[sec.name].nil?
+          # get blocking section out of the way
           replace_section(sec.name, shdr.sh_size)
         end
 
@@ -272,7 +284,6 @@ module PatchELF
         shoff_new = @buffer.size
         sh_size = ehdr.e_shoff + ehdr.e_shnum * ehdr.e_shentsize
         grow_file @buffer.size + sh_size
-
         ehdr.e_shoff = shoff_new
         raise PatchELF::PatchError, 'ehdr.e_shnum /= @sections.size' unless ehdr.e_shnum == @sections.size
 
@@ -285,15 +296,15 @@ module PatchELF
         end
       end
 
-      seg_num_bytes = @segments.first.header.num_bytes
       needed_space = (
         ehdr.num_bytes +
         (@segments.count * seg_num_bytes) +
         @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
       )
+      PatchELF::Logger.info "needed space is #{needed_space}"
 
       if needed_space > start_offset
-        needed_space += seg_num_bytes
+        needed_space += seg_num_bytes # new load segment is required
         needed_pages = PatchELF::Helper.alignup(needed_space - start_offset, page_size) / page_size
         raise PatchELF::PatchError, 'virtual address space underrun' if needed_pages * page_size > first_page
 
@@ -470,9 +481,8 @@ module PatchELF
       with_buf_at(0) { |b| ehdr.write(b) }
 
       shoff = ehdr.e_shoff
-      @sections.each_with_index do |sec, i|
-        shdr = sec.header
-        with_buf_at(shoff + i * shdr.num_bytes) { |b| shdr.write b }
+      with_buf_at(shoff) do |b|
+        @sections.each { |sec| sec.header.write b }
       end
 
       phoff = ehdr.e_phoff
