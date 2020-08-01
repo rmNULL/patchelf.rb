@@ -7,23 +7,6 @@ require 'elftools/util'
 require 'patchelf/helper'
 require 'fileutils'
 
-# module ELFTools
-#   module Structs
-#     [ELF32_Phdr, ELF64_Phdr].each do |cls|
-#       refine cls do
-#         include Comparable
-
-#         def <=>(other)
-#           return  1 if other.p_type == ELFTools::Constants::PT_PHDR
-#           return -1 if p_type == ELFTools::Constants::PT_PHDR
-
-#           p_paddr <=> other.p_paddr
-#         end
-#       end
-#     end
-#   end
-# end
-
 module ELFTools
   module Constants
     module PF
@@ -167,22 +150,17 @@ module PatchELF
       ehdr.e_phoff = ehdr.num_bytes
       ehdr.e_shoff = ehdr.e_shoff + shift
 
-      # shoff = ehdr.e_shoff
       @sections.each_with_index do |sec, i|
         next if i.zero? # dont touch NULL section
 
         shdr = sec.header
         shdr.sh_offset += shift
-        i
-        # with_buf_at(shoff + i * shdr.num_bytes) { |b| shdr.write b }
       end
-      # phoff = ehdr.e_phoff
-      @segments.each_with_index do |seg, i|
+
+      @segments.each do |seg|
         phdr = seg.header
         phdr.p_offset += shift
         phdr.p_align = page_size if phdr.p_align != 0 && (phdr.p_vaddr - phdr.p_offset) % phdr.p_align != 0
-        i
-        # with_buf_at(phoff + i * phdr.num_bytes) { |b| phdr.write b }
       end
 
       ehdr.e_phnum += 1
@@ -197,12 +175,14 @@ module PatchELF
         p_flags: ELFTools::Constants::PF_R | ELFTools::Constants::PF_W,
         p_align: page_size
       )
-      @segments.push ELFTools::Segments::Segment.new(phdr, @buffer)
+      # no stream
+      @segments.push ELFTools::Segments::Segment.new(phdr, nil)
 
       with_buf_at(0) { |b| ehdr.write(b) }
     end
 
     def sort_shdrs!
+      ehdr = @elf.header
       rel_syms = [ELFTools::Constants::SHT_REL, ELFTools::Constants::SHT_RELA]
 
       # Translate sh_link mappings to section names, since sorting the
@@ -214,6 +194,7 @@ module PatchELF
         info[s.name] = @sections[hdr.sh_info].name if hdr.sh_info.nonzero? && rel_syms.include?(hdr.sh_type)
       end
       shstrtab_name = @sections[@elf.header.e_shstrndx].name
+
       @sections.sort! { |me, you| me.header.sh_offset.to_i <=> you.header.sh_offset.to_i }
 
       # restore sh_info, sh_link
@@ -226,14 +207,14 @@ module PatchELF
         end
       end
 
-      @elf.header.e_shstrndx = @sections.find_index { |s| s.name == shstrtab_name }
+      ehdr.e_shstrndx = @sections.find_index { |s| s.name == shstrtab_name }
     end
 
     def sort_phdrs!
       pt_phdr = ELFTools::Constants::PT_PHDR
       @segments.sort! do |me, you|
-        return  1 if you.header.p_type == pt_phdr
-        return -1 if me.header.p_type == pt_phdr
+        next  1 if you.header.p_type == pt_phdr
+        next -1 if me.header.p_type == pt_phdr
 
         me.header.p_paddr.to_i <=> you.header.p_paddr.to_i
       end
@@ -245,13 +226,13 @@ module PatchELF
       sort_shdrs!
       last_replaced = 0
 
-      PatchELF::Logger.info @sections.first.name
+      # PatchELF::Logger.info @sections.first.name
 
       @sections.each_with_index { |sec, idx| last_replaced = idx if @replaced_sections[sec.name] }
       raise PatchELF::PatchError, 'last_replaced = 0' if last_replaced.zero?
       raise PatchELF::PatchError, 'last_replaced + 1 >= @sections.size' if last_replaced + 1 >= @sections.size
 
-      PatchELF::Logger.info "last replaced = #{last_replaced}"
+      # PatchELF::Logger.info "last replaced = #{last_replaced}"
 
       start_replacement_hdr = @sections[last_replaced + 1].header
       start_offset = start_replacement_hdr.sh_offset
@@ -313,11 +294,12 @@ module PatchELF
         shift_file(needed_pages, first_page)
       end
 
-      PatchELF::Logger.info "needed space is #{needed_space}"
+      # PatchELF::Logger.info "needed space is #{needed_space}"
 
       cur_off = ehdr.num_bytes + (@segments.count * seg_num_bytes)
       with_buf_at(cur_off) { |buf| buf.write "\x00" * (start_offset - cur_off) }
       cur_off = write_replaced_sections cur_off, first_page, 0
+      # PatchELF::Logger.info " cur_off = #{cur_off} "
       raise PatchELF::PatchError, 'cur_off /= needed_space' if cur_off != needed_space
 
       rewrite_headers first_page + ehdr.e_phoff
@@ -325,6 +307,8 @@ module PatchELF
 
     def rewrite_headers(phdr_address)
       ehdr = @elf.header
+      endian = @elf.endian
+
       # there can only be a single program header table according to ELF spec
       @segments.find { |seg| seg.header.p_type == ELFTools::Constants::PT_PHDR }&.tap do |seg|
         phdr = seg.header
@@ -334,52 +318,61 @@ module PatchELF
       end
 
       sort_phdrs!
-      with_buf_at(ehdr.e_phoff) do |buf|
-        @segments.each { |seg| seg.header.write(buf) }
-      end
+
+      # with_buf_at(ehdr.e_phoff) do |buf|
+      #   @segments.each { |seg| seg.header.write(buf) }
+      # end
       raise PatchELF::PatchError, 'ehdr.e_shnum /= @sections.count' unless ehdr.e_shnum == @sections.count
 
       sort_shdrs!
-      with_buf_at(ehdr.e_shoff) do |buf|
-        @sections.each { |section| section.header.write(buf) }
-      end
+      # with_buf_at(ehdr.e_shoff) do |buf|
+      #   @sections.each { |section| section.header.write(buf) }
+      # end
 
       @sections.find { |sec| sec.name == '.dynamic' }&.tap do |sec|
-        sec.each_tags do |tag|
-          break if (dyn = tag.header).d_tag == ELFTools::Constants::DT_NULL
+        with_buf_at(sec.header.sh_offset) do |buf|
+          dyn = ELFTools::Structs::ELF_Dyn.new(elf_class: sec.header.elf_class, endian: endian)
+          loop do
+            buf_update_pos = buf.tell
+            dyn.clear
+            dyn.read(buf)
+            break if dyn.d_tag == ELFTools::Constants::DT_NULL
 
-          case dyn.d_tag
-          when ELFTools::Constants::DT_STRTAB
-            dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_addr.to_i
-          when ELFTools::Constants::DT_STRSZ
-            dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_size.to_i
-          when ELFTools::Constants::DT_SYMTAB
-            dyn.d_val = @sections.find { |s| s.name == '.dynsym' }.header.sh_addr.to_i
-          when ELFTools::Constants::DT_HASH
-            dyn.d_val = @sections.find { |s| s.name == '.hash' }.header.sh_addr.to_i
-          when ELFTools::Constants::DT_GNU_HASH
-            dyn.d_val = @sections.find { |s| s.name == '.gnu.hash' }.header.sh_addr.to_i
-          when ELFTools::Constants::DT_JMPREL
-            shdr = @sections.find { |s| %w[.rel.plt .rela.plt .rela.IA_64.pltoff].include? s.name }&.header
-            raise PatchELF::PatchError, 'cannot find section corresponding to DT_JMPREL' if shdr.nil?
+            case dyn.d_tag
+            when ELFTools::Constants::DT_STRTAB
+              dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_addr.to_i
+            when ELFTools::Constants::DT_STRSZ
+              dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_size.to_i
+            when ELFTools::Constants::DT_SYMTAB
+              dyn.d_val = @sections.find { |s| s.name == '.dynsym' }.header.sh_addr.to_i
+            when ELFTools::Constants::DT_HASH
+              dyn.d_val = @sections.find { |s| s.name == '.hash' }.header.sh_addr.to_i
+            when ELFTools::Constants::DT_GNU_HASH
+              dyn.d_val = @sections.find { |s| s.name == '.gnu.hash' }.header.sh_addr.to_i
+            when ELFTools::Constants::DT_JMPREL
+              shdr = @sections.find { |s| %w[.rel.plt .rela.plt .rela.IA_64.pltoff].include? s.name }&.header
+              raise PatchELF::PatchError, 'cannot find section corresponding to DT_JMPREL' if shdr.nil?
 
-            dyn.d_val = shdr.sh_addr.to_i
-          when ELFTools::Constants::DT_REL
-            # regarding .rel.got, NixOS/patchelf says
-            # "no idea if this makes sense, but it was needed for some program"
-            shdr = @sections.find { |s| %w[.rel.dyn .rel.got].include? s.name }&.header
-            next if shdr.nil? # patchelf claims no problem in skipping
+              dyn.d_val = shdr.sh_addr.to_i
+            when ELFTools::Constants::DT_REL
+              # regarding .rel.got, NixOS/patchelf says
+              # "no idea if this makes sense, but it was needed for some program"
+              shdr = @sections.find { |s| %w[.rel.dyn .rel.got].include? s.name }&.header
+              next if shdr.nil? # patchelf claims no problem in skipping
 
-            dyn.d_val = shdr.sh_addr.to_i
-          when ELFTools::Constants::DT_RELA
-            shdr = @sections.find { |s| s.name == '.rela.dyn' }&.header
-            next if shdr.nil? # patchelf claims no problem in skipping
+              dyn.d_val = shdr.sh_addr.to_i
+            when ELFTools::Constants::DT_RELA
+              shdr = @sections.find { |s| s.name == '.rela.dyn' }&.header
+              next if shdr.nil? # patchelf claims no problem in skipping
 
-            dyn.d_val = shdr.sh_addr.to_i
-          when ELFTools::Constants::DT_VERNEED
-            dyn.d_val = @sections.find { |s| s.name == '.gnu.version_r' }.header.sh_addr.to_i
-          when ELFTools::Constants::DT_VERSYM
-            dyn.d_val = @sections.find { |s| s.name == '.gnu.version' }.header.sh_addr.to_i
+              dyn.d_val = shdr.sh_addr.to_i
+            when ELFTools::Constants::DT_VERNEED
+              dyn.d_val = @sections.find { |s| s.name == '.gnu.version_r' }.header.sh_addr.to_i
+            when ELFTools::Constants::DT_VERSYM
+              dyn.d_val = @sections.find { |s| s.name == '.gnu.version' }.header.sh_addr.to_i
+            end
+
+            with_buf_at(buf_update_pos) { |wbuf| dyn.write(wbuf) }
           end
         end
       end
@@ -389,7 +382,7 @@ module PatchELF
         shdr = sec.header
         next unless symtabs.include?(shdr.sh_type)
 
-        sym = ELFTools::Structs::ELF_sym[64].new endian: shdr.class.self_endian
+        sym = ELFTools::Structs::ELF_sym[ehdr.elf_class].new endian: shdr.class.self_endian
         with_buf_at(shdr.sh_offset) do |buf|
           sec.num_symbols.times do |entry|
             sym.clear
@@ -434,6 +427,7 @@ module PatchELF
 
       @replaced_sections.each do |rsec_name, rsec_data|
         shdr = @sections.find { |s| s.name == rsec_name }.header
+
         with_buf_at(cur_off) { |b| b.write rsec_data }
 
         shdr.sh_offset = cur_off
@@ -482,14 +476,13 @@ module PatchELF
       with_buf_at(0) { |b| ehdr.write(b) }
 
       shoff = ehdr.e_shoff
-      with_buf_at(shoff) do |b|
-        @sections.each { |sec| sec.header.write b }
+      with_buf_at(shoff) do |buf|
+        @sections.each { |sec| sec.header.write buf }
       end
 
       phoff = ehdr.e_phoff
-      @segments.each_with_index do |seg, i|
-        phdr = seg.header
-        with_buf_at(phoff + i * phdr.num_bytes) { |b| phdr.write b }
+      with_buf_at(phoff) do |buf|
+        @segments.each { |seg| seg.header.write buf }
       end
 
       File.open(out_file, 'wb+') do |f|
