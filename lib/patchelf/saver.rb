@@ -25,6 +25,8 @@ module ELFTools
 
     module DT
       DT_VERSYM	= 0x6ffffff0
+      # Ugly hack cped as is from patchelf, used to ignore DT_RUNPATH when DT_RPATH is forced.
+      DT_IGNORE = 0x00726e67
     end
     include DT
   end
@@ -103,12 +105,81 @@ module PatchELF
       nil
     end
 
+    def buf_cstr(off)
+      cstr = []
+      with_buf_at(off) do |buf|
+        loop do
+          c = buf.read 1
+          break if c.nil? || c == "\x00"
+
+          cstr.push c
+        end
+      end
+      cstr.join
+    end
+
+    def dynstr
+      @sections.find { |s| s.name == '.dynstr' }
+    end
+
     def modify_runpath
       nil
     end
 
-    def modify_rpath
-      nil
+    def modify_rpath(rpath_sym: :rpath)
+      force_rpath = rpath_sym == :rpath
+      new_rpath = @set[rpath_sym]
+
+      dyn_rpath = dyn_runpath = nil
+      needed_libs = []
+      shdr_dynstr = dynstr&.header
+      strtab_off = shdr_dynstr.sh_offset
+      rpath_off = nil
+
+      each_dynamic_tags do |dyn|
+        case dyn.d_tag
+        when ELFTools::Constants::DT_RPATH
+          dyn_rpath = dyn
+          rpath_off = strtab_off + dyn.d_val if dyn_runpath.nil?
+        when ELFTools::Constants::DT_RUNPATH
+          dyn_runpath = dyn
+          rpath_off = strtab_off + dyn.d_val
+        when ELFTools::Constants::DT_NEEDED
+          needed_libs.push buf_cstr(strtab_off + dyn.d_val)
+        end
+      end
+      old_rpath = rpath_off ? buf_cstr(rpath_off) : ''
+      return if old_rpath == new_rpath
+
+      with_buf_at(rpath_off) { |b| b.write('X' * old_rpath.size) } if rpath_off
+
+
+      if !force_rpath && dyn_rpath && dyn_runpath.nil?
+        dyn_rpath.d_tag = ELFTools::Constants::DT_RUNPATH
+        dyn_runpath = dyn_rpath
+        dyn_rpath = nil
+      end
+
+      dyn_runpath.d_tag = ELFTools::Constants::DT_IGNORE if force_rpath && dyn_rpath && dyn_runpath
+
+      if new_rpath.size <= old_rpath.size
+        with_buf_at(rpath_off) { |b| b.write new_rpath }
+        return
+      end
+
+      PatchELF::Logger.info 'rpath is too long, resizing...'
+      new_dynstr = replace_section '.dynstr', shdr_dynstr.sh_size + new_rpath.size + 1
+      new_dynstr[(shdr_dynstr.sh_size)..-1] = "#{new_rpath}\x00"
+
+
+      dyn_runpath.d_val = shdr_dynstr.sh_size if dyn_runpath
+      dyn_rpath.d_val = shdr_dynstr.sh_size if dyn_rpath
+
+      if !dyn_rpath && !dyn_runpath
+        replace_section '.dynamic', shdr
+      end
+
+
     end
 
     def modify_soname
