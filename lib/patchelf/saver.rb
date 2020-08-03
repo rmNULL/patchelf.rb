@@ -136,7 +136,9 @@ module PatchELF
       strtab_off = shdr_dynstr.sh_offset
       rpath_off = nil
 
-      each_dynamic_tags do |dyn|
+      dyn_num_bytes = nil
+      dt_null_idx = 0
+      each_dynamic_tags do |dyn, _off|
         case dyn.d_tag
         when ELFTools::Constants::DT_RPATH
           dyn_rpath = dyn
@@ -147,12 +149,13 @@ module PatchELF
         when ELFTools::Constants::DT_NEEDED
           needed_libs.push buf_cstr(strtab_off + dyn.d_val)
         end
+        dyn_num_bytes ||= dyn.num_bytes
+        dt_null_idx += 1
       end
       old_rpath = rpath_off ? buf_cstr(rpath_off) : ''
       return if old_rpath == new_rpath
 
       with_buf_at(rpath_off) { |b| b.write('X' * old_rpath.size) } if rpath_off
-
 
       if !force_rpath && dyn_rpath && dyn_runpath.nil?
         dyn_rpath.d_tag = ELFTools::Constants::DT_RUNPATH
@@ -169,17 +172,31 @@ module PatchELF
 
       PatchELF::Logger.info 'rpath is too long, resizing...'
       new_dynstr = replace_section '.dynstr', shdr_dynstr.sh_size + new_rpath.size + 1
-      new_dynstr[(shdr_dynstr.sh_size)..-1] = "#{new_rpath}\x00"
+      new_dynstr[(shdr_dynstr.sh_size.to_i)..(new_dynstr.size)] = "#{new_rpath}\x00"
 
+      dyn_runpath.d_val = shdr_dynstr.sh_size.to_i if dyn_runpath
+      dyn_rpath.d_val = shdr_dynstr.sh_size.to_i if dyn_rpath
 
-      dyn_runpath.d_val = shdr_dynstr.sh_size if dyn_runpath
-      dyn_rpath.d_val = shdr_dynstr.sh_size if dyn_rpath
+      return if dyn_rpath || dyn_runpath
 
-      if !dyn_rpath && !dyn_runpath
-        replace_section '.dynamic', shdr
-      end
+      # allot for new dt_runpath
+      shdr_dynamic = @sections.find { |sec| sec.name == '.dynamic' }&.header
+      new_dynamic_data = replace_section '.dynamic', shdr_dynamic.sh_size + dyn_num_bytes
 
+      # consider DT_NULL when copying
+      replacement_size = dyn_num_bytes * dt_null_idx.succ
 
+      # make space for dt_runpath tag at the top, shift data by one tag positon
+      new_dynamic_data[dyn_num_bytes..(replacement_size + dyn_num_bytes)] = new_dynamic_data[0..replacement_size]
+
+      dyn_rpath = ELFTools::Structs::ELF_Dyn.new endian: shdr_dynamic.class.self_endian, class: shdr_dynamic.elf_class
+      dyn_rpath.d_tag = force_rpath ? ELFTools::Constants::DT_RPATH : ELFTools::Constants::DT_RUNPATH
+      dyn_rpath.d_val = dyn_num_bytes
+
+      zi = StringIO.new
+      dyn_rpath.write zi
+      zi.rewind
+      new_dynamic_data[0..dyn_num_bytes] = zi.read
     end
 
     def modify_soname
