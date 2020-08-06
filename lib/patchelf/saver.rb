@@ -574,7 +574,58 @@ module PatchELF
     end
 
     def rewrite_sections_library
-      nil
+      start_page =
+        @segments.map { |seg| PatchELF::Helper.alignup(seg.header.p_vaddr + seg.header.p_memsz, page_size) }
+                 .max
+
+      PatchELF::Logger.info "Last page is 0x#{start_page.to_s 16}"
+
+      pht_size = ehdr.num_bytes + @segments.count.succ * @segments.first.header.num_bytes
+      # replace sections that may overlap with expanded program header table
+      @sections.each_with_index do |sec, idx|
+        shdr = sec.header
+        next if idx.zero? || @replaced_sections[sec.name]
+        break if shdr.sh_addr > pht_size
+
+        replace_section sec.name, shdr.sh_size
+      end
+
+      needed_space =
+        @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
+      PatchELF::Logger.info "needed space = #{needed_space}"
+
+      start_offset = PatchELF::Helper.alignup(@buffer.size, page_size)
+      grow_file start_offset + needed_space
+
+      # executable shared object
+      if @segments.any? { |seg| seg.header.p_type == ELFTools::Constants::PT_INTERP }
+        if start_offset > start_page
+          PatchELF::Logger.info(
+            "shifting new PT_LOAD segment by #{start_offset - start_page} bytes to work around a Linux kernel bug"
+          )
+        end
+        start_page = start_offset
+      end
+
+      ehdr.e_phnum += 1
+      phdr = ELFTools::Structs::ELF_Phdr[@elf.elf_class].new(
+        endian: @elf.endian,
+        p_type: ELFTools::Constants::PT_LOAD,
+        p_offset: start_offset,
+        p_vaddr: start_page,
+        p_paddr: start_page,
+        p_filesz: needed_space,
+        p_memsz: needed_space,
+        p_flags: ELFTools::Constants::PF_R | ELFTools::Constants::PF_W,
+        p_align: page_size
+      )
+      # no stream
+      @segments.push ELFTools::Segments::Segment.new(phdr, nil)
+
+      cur_off = write_replaced_sections start_offset, start_page, start_offset
+      raise PatchELF::PatchError, 'cur_off /= start_offset+needed_space' if cur_off != start_offset + needed_space
+
+      rewrite_headers ehdr.e_phoff
     end
 
     def rewrite_sections
