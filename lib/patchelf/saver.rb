@@ -86,15 +86,19 @@ module PatchELF
 
     # size is include NUL byte
     def replace_section(section, size)
-      s = (@replaced_sections[section] || @sections.find { |sc| sc.name == section }.data)
-      rs = if s.size == size
-             s
-           elsif s.size < size
-             s.ljust(size, "\x00")
-           else
-             s[0...size] + "\x00"
-           end
-      @replaced_sections[section] = rs
+      data = @replaced_sections[section]
+      unless data
+        shdr = @sections.find { |sc| sc.name == section }.header
+        with_buf_at(shdr.sh_offset) { |b| data = b.read shdr.sh_size }
+      end
+      rep_data = if data.size == size
+                   data
+                 elsif data.size < size
+                   data.ljust(size, "\x00")
+                 else
+                   data[0...size] + "\x00"
+                 end
+      @replaced_sections[section] = rep_data
     end
 
     def modify_interpreter
@@ -123,7 +127,7 @@ module PatchELF
     end
 
     def modify_runpath
-      nil
+      modify_rpath rpath_sym: :runpath
     end
 
     def modify_rpath(rpath_sym: :rpath)
@@ -132,19 +136,31 @@ module PatchELF
 
       dyn_rpath = dyn_runpath = nil
       needed_libs = []
-      shdr_dynstr = dynstr&.header
+      shdr_dynstr = dynstr.header
       strtab_off = shdr_dynstr.sh_offset
       rpath_off = nil
 
       dyn_num_bytes = nil
       dt_null_idx = 0
-      each_dynamic_tags do |dyn, _off|
+
+      dyn_buf_off = {}
+
+      endian = shdr_dynstr.class.self_endian
+      elf_class = shdr_dynstr.elf_class
+      each_dynamic_tags do |dyn, off|
         case dyn.d_tag
         when ELFTools::Constants::DT_RPATH
-          dyn_rpath = dyn
+          dyn_buf_off[:rpath] = off
+          # clone does shallow copy, and for some reason d_tag and d_val can't be pass as argument
+          dyn_rpath = ELFTools::Structs::ELF_Dyn.new(endian: endian, elf_class: elf_class)
+          dyn_rpath.d_tag = dyn.d_tag.to_i
+          dyn_rpath.d_val = dyn.d_val.to_i
           rpath_off = strtab_off + dyn.d_val if dyn_runpath.nil?
         when ELFTools::Constants::DT_RUNPATH
-          dyn_runpath = dyn
+          dyn_buf_off[:runpath] = off
+          dyn_runpath = ELFTools::Structs::ELF_Dyn.new(endian: endian, elf_class: elf_class)
+          dyn_runpath.d_tag = dyn.d_tag.to_i
+          dyn_runpath.d_val = dyn.d_val.to_i
           rpath_off = strtab_off + dyn.d_val
         when ELFTools::Constants::DT_NEEDED
           needed_libs.push buf_cstr(strtab_off + dyn.d_val)
@@ -166,17 +182,26 @@ module PatchELF
       dyn_runpath.d_tag = ELFTools::Constants::DT_IGNORE if force_rpath && dyn_rpath && dyn_runpath
 
       if new_rpath.size <= old_rpath.size
-        with_buf_at(rpath_off) { |b| b.write new_rpath }
+        with_buf_at(rpath_off) { |b| b.write "#{new_rpath}\x00" }
         return
       end
 
-      PatchELF::Logger.info 'rpath is too long, resizing...'
+      # PatchELF::Logger.info 'rpath is too long, resizing...'
+      # we can start writing from (shdr_dynstr.sh_size - old_rpath.size)
+      # not doing so to maintain bit to bit equality with patchelf v.0.10
       new_dynstr = replace_section '.dynstr', shdr_dynstr.sh_size + new_rpath.size + 1
-      new_dynstr[(shdr_dynstr.sh_size.to_i)..(new_dynstr.size)] = "#{new_rpath}\x00"
+      new_rpath_strtab_idx = shdr_dynstr.sh_size.to_i
+      new_dynstr[new_rpath_strtab_idx..(new_rpath_strtab_idx + new_rpath.size)] = "#{new_rpath}\x00"
 
-      dyn_runpath.d_val = shdr_dynstr.sh_size.to_i if dyn_runpath
-      dyn_rpath.d_val = shdr_dynstr.sh_size.to_i if dyn_rpath
+      if dyn_runpath
+        dyn_runpath.d_val = new_rpath_strtab_idx
+        with_buf_at(dyn_buf_off[:runpath]) { |b| dyn_runpath.write(b) }
+      end
 
+      if dyn_rpath
+        dyn_rpath.d_val = new_rpath_strtab_idx
+        with_buf_at(dyn_buf_off[:rpath]) { |b| dyn_rpath.write(b) }
+      end
       return if dyn_rpath || dyn_runpath
 
       # allot for new dt_runpath
@@ -184,14 +209,14 @@ module PatchELF
       new_dynamic_data = replace_section '.dynamic', shdr_dynamic.sh_size + dyn_num_bytes
 
       # consider DT_NULL when copying
-      replacement_size = dyn_num_bytes * dt_null_idx.succ
+      replacement_size = (dt_null_idx + 1) * dyn_num_bytes
 
       # make space for dt_runpath tag at the top, shift data by one tag positon
       new_dynamic_data[dyn_num_bytes..(replacement_size + dyn_num_bytes)] = new_dynamic_data[0..replacement_size]
 
       dyn_rpath = ELFTools::Structs::ELF_Dyn.new endian: shdr_dynamic.class.self_endian, class: shdr_dynamic.elf_class
       dyn_rpath.d_tag = force_rpath ? ELFTools::Constants::DT_RPATH : ELFTools::Constants::DT_RUNPATH
-      dyn_rpath.d_val = dyn_num_bytes
+      dyn_rpath.d_val = new_rpath_strtab_idx
 
       zi = StringIO.new
       dyn_rpath.write zi
@@ -358,6 +383,7 @@ module PatchELF
           last_replaced = idx - 1
           break
         elsif @replaced_sections[sec.name].nil?
+          # PatchELF::Logger.info " replacing section #{sec.name} which is in the way"
           # get blocking section out of the way
           replace_section(sec.name, shdr.sh_size)
         end
@@ -365,11 +391,14 @@ module PatchELF
         prev_sec_name = sec.name
       end
 
+      # PatchELF::Logger.info "first reserved offset/addr is 0x#{start_offset.to_i.to_s 16}/0x#{start_addr.to_i.to_s 16}"
+
       unless start_addr % page_size == start_offset % page_size
         raise PatchELF::PatchError, 'start_addr /= start_offset (mod PAGE_SIZE)'
       end
 
       first_page = start_addr - start_offset
+      # PatchELF::Logger.info "first page is 0x#{first_page.to_i.to_s 16}"
 
       if ehdr.e_shoff < start_offset
         shoff_new = @buffer.size
@@ -393,9 +422,14 @@ module PatchELF
         @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
       )
 
+      # PatchELF::Logger.info "needed space is #{needed_space}"
+
       if needed_space > start_offset
         needed_space += seg_num_bytes # new load segment is required
+        # PatchELF::Logger.info "needed space is #{needed_space}"
+
         needed_pages = PatchELF::Helper.alignup(needed_space - start_offset, page_size) / page_size
+        # PatchELF::Logger.info "needed pages is #{needed_pages}"
         raise PatchELF::PatchError, 'virtual address space underrun' if needed_pages * page_size > first_page
 
         first_page -= needed_pages * page_size
@@ -407,6 +441,8 @@ module PatchELF
       # PatchELF::Logger.info "needed space is #{needed_space}"
 
       cur_off = ehdr.num_bytes + (@segments.count * seg_num_bytes)
+      # PatchELF::Logger.info "clearing first #{start_offset - cur_off} bytes"
+
       with_buf_at(cur_off) { |buf| buf.write "\x00" * (start_offset - cur_off) }
       cur_off = write_replaced_sections cur_off, first_page, 0
       # PatchELF::Logger.info " cur_off = #{cur_off} "
@@ -449,15 +485,15 @@ module PatchELF
 
       sort_phdrs!
 
-      # with_buf_at(ehdr.e_phoff) do |buf|
-      #   @segments.each { |seg| seg.header.write(buf) }
-      # end
+      with_buf_at(ehdr.e_phoff) do |buf|
+        @segments.each { |seg| seg.header.write(buf) }
+      end
       raise PatchELF::PatchError, 'ehdr.e_shnum /= @sections.count' unless ehdr.e_shnum == @sections.count
 
       sort_shdrs!
-      # with_buf_at(ehdr.e_shoff) do |buf|
-      #   @sections.each { |section| section.header.write(buf) }
-      # end
+      with_buf_at(ehdr.e_shoff) do |buf|
+        @sections.each { |section| section.header.write(buf) }
+      end
 
       each_dynamic_tags do |dyn, buf_off|
         case dyn.d_tag
@@ -545,9 +581,12 @@ module PatchELF
         with_buf_at(shdr.sh_offset) { |b| b.write('X' * shdr.sh_size) } if shdr.sh_type != sht_no_bits
       end
 
-      @replaced_sections.each do |rsec_name, rsec_data|
+      # the sort is necessary, the strategy in ruby and Cpp to iterate map/hash
+      # is different, patchelf v0.10 iterates the replaced_sections sorted by
+      # keys.
+      @replaced_sections.sort.each do |rsec_name, rsec_data|
         shdr = @sections.find { |s| s.name == rsec_name }.header
-
+        # PatchELF::Logger.info "rewriting section '#{rsec_name}' from offset 0x#{shdr.sh_offset.to_i.to_s 16}(size #{shdr.sh_size}) to offset 0x#{cur_off.to_i.to_s 16}(size #{rsec_data.size})"
         with_buf_at(cur_off) { |b| b.write rsec_data }
 
         shdr.sh_offset = cur_off
@@ -578,7 +617,7 @@ module PatchELF
         @segments.map { |seg| PatchELF::Helper.alignup(seg.header.p_vaddr + seg.header.p_memsz, page_size) }
                  .max
 
-      PatchELF::Logger.info "Last page is 0x#{start_page.to_s 16}"
+      # PatchELF::Logger.info "Last page is 0x#{start_page.to_s 16}"
 
       pht_size = ehdr.num_bytes + @segments.count.succ * @segments.first.header.num_bytes
       # replace sections that may overlap with expanded program header table
@@ -592,18 +631,18 @@ module PatchELF
 
       needed_space =
         @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
-      PatchELF::Logger.info "needed space = #{needed_space}"
+      # PatchELF::Logger.info "needed space = #{needed_space}"
 
       start_offset = PatchELF::Helper.alignup(@buffer.size, page_size)
       grow_file start_offset + needed_space
 
       # executable shared object
       if @segments.any? { |seg| seg.header.p_type == ELFTools::Constants::PT_INTERP }
-        if start_offset > start_page
-          PatchELF::Logger.info(
-            "shifting new PT_LOAD segment by #{start_offset - start_page} bytes to work around a Linux kernel bug"
-          )
-        end
+        # if start_offset > start_page
+        #   PatchELF::Logger.info(
+        #     "shifting new PT_LOAD segment by #{start_offset - start_page} bytes to work around a Linux kernel bug"
+        #   )
+        # end
         start_page = start_offset
       end
 
@@ -645,15 +684,15 @@ module PatchELF
     def patch_out
       with_buf_at(0) { |b| ehdr.write(b) }
 
-      shoff = ehdr.e_shoff
-      with_buf_at(shoff) do |buf|
-        @sections.each { |sec| sec.header.write buf }
-      end
+      # shoff = ehdr.e_shoff
+      # with_buf_at(shoff) do |buf|
+      #   @sections.each { |sec| sec.header.write buf }
+      # end
 
-      phoff = ehdr.e_phoff
-      with_buf_at(phoff) do |buf|
-        @segments.each { |seg| seg.header.write buf }
-      end
+      # phoff = ehdr.e_phoff
+      # with_buf_at(phoff) do |buf|
+      #   @segments.each { |seg| seg.header.write buf }
+      # end
 
       File.open(out_file, 'wb+') do |f|
         @buffer.rewind
