@@ -58,6 +58,7 @@ module PatchELF
 
       @segments = @elf.segments # usage similar to phdrs
       @sections = @elf.sections # usage similar to shdrs
+      update_section_idx!
       # {String => String}
       # section name to its data mapping
       @replaced_sections = {}
@@ -76,6 +77,10 @@ module PatchELF
 
     private
 
+    def update_section_idx!
+      @section_idx_by_name = @sections.map.with_index { |sec, idx| [sec.name, idx] }.to_h
+    end
+
     def ehdr
       @elf.header
     end
@@ -84,11 +89,23 @@ module PatchELF
       PatchELF::Helper::PAGE_SIZE
     end
 
+    def find_section_idx(sec_name)
+      # @sections.find_index { |s| s.name == sec_name }
+      @section_idx_by_name[sec_name]
+    end
+
+    def find_section(sec_name)
+      idx = find_section_idx sec_name
+      return unless idx
+
+      @sections[idx]
+    end
+
     # size is include NUL byte
     def replace_section(section, size)
       data = @replaced_sections[section]
       unless data
-        shdr = @sections.find { |sc| sc.name == section }.header
+        shdr = find_section(section).header
         with_buf_at(shdr.sh_offset) { |b| data = b.read shdr.sh_size }
       end
       rep_data = if data.size == size
@@ -123,7 +140,7 @@ module PatchELF
     end
 
     def dynstr
-      @sections.find { |s| s.name == '.dynstr' }
+      find_section '.dynstr'
     end
 
     def modify_runpath
@@ -205,7 +222,7 @@ module PatchELF
       return if dyn_rpath || dyn_runpath
 
       # allot for new dt_runpath
-      shdr_dynamic = @sections.find { |sec| sec.name == '.dynamic' }&.header
+      shdr_dynamic = find_section('.dynamic').header
       new_dynamic_data = replace_section '.dynamic', shdr_dynamic.sh_size + dyn_num_bytes
 
       # consider DT_NULL when copying
@@ -332,18 +349,19 @@ module PatchELF
       shstrtab_name = @sections[ehdr.e_shstrndx].name
 
       @sections.sort! { |me, you| me.header.sh_offset.to_i <=> you.header.sh_offset.to_i }
+      update_section_idx!
 
       # restore sh_info, sh_link
       @sections.each do |sec|
         hdr = sec.header
-        hdr.sh_link = @sections.find_index { |s| s.name == linkage[sec.name] } if hdr.sh_link.nonzero?
+        hdr.sh_link = find_section_idx(linkage[sec.name]) if hdr.sh_link.nonzero?
         if hdr.sh_info.nonzero? && rel_syms.include?(hdr.sh_type)
           info_sec_name = info[sec.name]
-          hdr.sh_info = @sections.find_index { |s| s.name == info_sec_name }
+          hdr.sh_info = find_section_idx info_sec_name
         end
       end
 
-      ehdr.e_shstrndx = @sections.find_index { |s| s.name == shstrtab_name }
+      ehdr.e_shstrndx = find_section_idx shstrtab_name
     end
 
     def sort_phdrs!
@@ -455,7 +473,7 @@ module PatchELF
     def each_dynamic_tags
       return unless block_given?
 
-      sec = @sections.find { |sec| sec.name == '.dynamic' }
+      sec = find_section '.dynamic'
       return unless sec
 
       shdr = sec.header
@@ -498,15 +516,15 @@ module PatchELF
       each_dynamic_tags do |dyn, buf_off|
         case dyn.d_tag
         when ELFTools::Constants::DT_STRTAB
-          dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_addr.to_i
+          dyn.d_val = dynstr.header.sh_addr.to_i
         when ELFTools::Constants::DT_STRSZ
-          dyn.d_val = @sections.find { |s| s.name == '.dynstr' }.header.sh_size.to_i
+          dyn.d_val = dynstr.header.sh_size.to_i
         when ELFTools::Constants::DT_SYMTAB
-          dyn.d_val = @sections.find { |s| s.name == '.dynsym' }.header.sh_addr.to_i
+          dyn.d_val = find_section('.dynsym').header.sh_addr.to_i
         when ELFTools::Constants::DT_HASH
-          dyn.d_val = @sections.find { |s| s.name == '.hash' }.header.sh_addr.to_i
+          dyn.d_val = find_section('.hash').header.sh_addr.to_i
         when ELFTools::Constants::DT_GNU_HASH
-          dyn.d_val = @sections.find { |s| s.name == '.gnu.hash' }.header.sh_addr.to_i
+          dyn.d_val = find_section('.gnu.hash').header.sh_addr.to_i
         when ELFTools::Constants::DT_JMPREL
           shdr = @sections.find { |s| %w[.rel.plt .rela.plt .rela.IA_64.pltoff].include? s.name }&.header
           raise PatchELF::PatchError, 'cannot find section corresponding to DT_JMPREL' if shdr.nil?
@@ -520,25 +538,26 @@ module PatchELF
 
           dyn.d_val = shdr.sh_addr.to_i
         when ELFTools::Constants::DT_RELA
-          shdr = @sections.find { |s| s.name == '.rela.dyn' }&.header
+          shdr = find_section('.rela.dyn')&.header
           next if shdr.nil? # patchelf claims no problem in skipping
 
           dyn.d_val = shdr.sh_addr.to_i
         when ELFTools::Constants::DT_VERNEED
-          dyn.d_val = @sections.find { |s| s.name == '.gnu.version_r' }.header.sh_addr.to_i
+          dyn.d_val = find_section('.gnu.version_r').header.sh_addr.to_i
         when ELFTools::Constants::DT_VERSYM
-          dyn.d_val = @sections.find { |s| s.name == '.gnu.version' }.header.sh_addr.to_i
+          dyn.d_val = find_section('.gnu.version').header.sh_addr.to_i
         end
 
         with_buf_at(buf_off) { |wbuf| dyn.write(wbuf) }
       end
 
+      sym = ELFTools::Structs::ELF_sym[ehdr.elf_class].new endian: ehdr.class.self_endian
       symtabs = [ELFTools::Constants::SHT_SYMTAB, ELFTools::Constants::SHT_DYNSYM]
+
       @sections.each do |sec|
         shdr = sec.header
         next unless symtabs.include?(shdr.sh_type)
 
-        sym = ELFTools::Structs::ELF_sym[ehdr.elf_class].new endian: shdr.class.self_endian
         with_buf_at(shdr.sh_offset) do |buf|
           sec.num_symbols.times do |entry|
             sym.clear
@@ -556,7 +575,7 @@ module PatchELF
             old_sec = old_sections[shndx]
             raise PatchELF::PatchError, '@elf.sections[shndx] is nil' if old_sec.nil?
 
-            new_index = @sections.find_index { |s| s.name == old_sec.name }
+            new_index = find_section_idx old_sec.name
             sym.st_shndx = new_index
             # right 4 bits in the st_info field is st_type
             if (sym.st_info & 0xF) == ELFTools::Constants::STT_SECTION
@@ -577,7 +596,7 @@ module PatchELF
       # the original source says this has to be done seperately to
       # prevent clobbering the previously written section contents.
       @replaced_sections.each do |rsec_name, _|
-        shdr = @sections.find { |s| s.name == rsec_name }.header
+        shdr = find_section(rsec_name).header
         with_buf_at(shdr.sh_offset) { |b| b.write('X' * shdr.sh_size) } if shdr.sh_type != sht_no_bits
       end
 
@@ -585,7 +604,7 @@ module PatchELF
       # is different, patchelf v0.10 iterates the replaced_sections sorted by
       # keys.
       @replaced_sections.sort.each do |rsec_name, rsec_data|
-        shdr = @sections.find { |s| s.name == rsec_name }.header
+        shdr = find_section(rsec_name).header
         # PatchELF::Logger.info "rewriting section '#{rsec_name}' from offset 0x#{shdr.sh_offset.to_i.to_s 16}(size #{shdr.sh_size}) to offset 0x#{cur_off.to_i.to_s 16}(size #{rsec_data.size})"
         with_buf_at(cur_off) { |b| b.write rsec_data }
 
