@@ -554,6 +554,7 @@ module PatchELF
       sym = ELFTools::Structs::ELF_sym[ehdr.elf_class].new endian: ehdr.class.self_endian
       symtabs = [ELFTools::Constants::SHT_SYMTAB, ELFTools::Constants::SHT_DYNSYM]
 
+      old_sections = @elf.sections
       @sections.each do |sec|
         shdr = sec.header
         next unless symtabs.include?(shdr.sh_type)
@@ -566,7 +567,6 @@ module PatchELF
             shndx = sym.st_shndx
             next if shndx == ELFTools::Constants::SHN_UNDEF || shndx >= ELFTools::Constants::SHN_LORESERVE
 
-            old_sections = @elf.sections
             if shndx >= old_sections.count
               PatchELF::Logger.warn "entry #{entry} in symbol table refers to a non existing section, skipping"
               next
@@ -717,18 +717,6 @@ module PatchELF
         @buffer.rewind
         f.write @buffer.read
       end
-    end
-
-    # @return [ELFTools::Sections::Section?]
-    def section_header(name)
-      sec = @elf.section_by_name(name)
-      return if sec.nil?
-
-      sec.header
-    end
-
-    def dynamic
-      @dynamic ||= @elf.segment_by_type(:dynamic)
     end
   end
 end
