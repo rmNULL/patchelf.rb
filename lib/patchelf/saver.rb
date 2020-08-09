@@ -271,9 +271,9 @@ module PatchELF
 
       opos = @buffer.tell
       @buffer.seek pos
-      res = yield @buffer
+      yield @buffer
       @buffer.seek opos
-      res
+      nil
     end
 
     def grow_file(newsz)
@@ -551,20 +551,37 @@ module PatchELF
         with_buf_at(buf_off) { |wbuf| dyn.write(wbuf) }
       end
 
-      sym = ELFTools::Structs::ELF_sym[ehdr.elf_class].new endian: ehdr.class.self_endian
+      old_sections = @elf.sections
       symtabs = [ELFTools::Constants::SHT_SYMTAB, ELFTools::Constants::SHT_DYNSYM]
 
-      old_sections = @elf.sections
+      endian = ehdr.class.self_endian
+
+      # resort to manual packing and unpacking of data,
+      # as using bindata is painfully slow :(
+      if ehdr.elf_class == 32
+        sym_num_bytes = 16 # u32 u32 u32 u8 u8 u16
+        pack_code = endian == :little ? 'VVVCCv' : 'NNNCCn'
+        pack_st_shndx = 5
+        pack_st_value = 1
+      else # 64
+        sym_num_bytes = 24 # u32 u8 u8 u16 u64 u64
+        pack_code = endian == :little ? 'VCCvQ<Q<' : 'NCCnQ>Q>'
+        pack_st_info = 1
+        pack_st_shndx = 3
+        pack_st_value = 4
+      end
+
       @sections.each do |sec|
         shdr = sec.header
         next unless symtabs.include?(shdr.sh_type)
 
         with_buf_at(shdr.sh_offset) do |buf|
-          sec.num_symbols.times do |entry|
-            sym.clear
-            sym.read(buf)
+          num_symbols = shdr.sh_size / sym_num_bytes
+          num_symbols.times do |entry|
+            rd = buf.read(sym_num_bytes)
+            sym = rd.unpack(pack_code)
 
-            shndx = sym.st_shndx
+            shndx = sym[pack_st_shndx]
             next if shndx == ELFTools::Constants::SHN_UNDEF || shndx >= ELFTools::Constants::SHN_LORESERVE
 
             if shndx >= old_sections.count
@@ -576,13 +593,16 @@ module PatchELF
             raise PatchELF::PatchError, '@elf.sections[shndx] is nil' if old_sec.nil?
 
             new_index = find_section_idx old_sec.name
-            sym.st_shndx = new_index
+
+            sym[pack_st_shndx] = new_index
+
             # right 4 bits in the st_info field is st_type
-            if (sym.st_info & 0xF) == ELFTools::Constants::STT_SECTION
-              sym.st_value = @sections[new_index].header.sh_addr.to_i
+            if (sym[pack_st_info] & 0xF) == ELFTools::Constants::STT_SECTION
+              sym[pack_st_value] = @sections[new_index].header.sh_addr.to_i
             end
 
-            with_buf_at(shdr.sh_offset + entry * sym.num_bytes) { |tbuf| sym.write(tbuf) }
+            buf.seek buf.tell - sym_num_bytes
+            buf.write sym.pack(pack_code)
           end
         end
       end
