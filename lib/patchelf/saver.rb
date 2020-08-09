@@ -561,6 +561,7 @@ module PatchELF
       if ehdr.elf_class == 32
         sym_num_bytes = 16 # u32 u32 u32 u8 u8 u16
         pack_code = endian == :little ? 'VVVCCv' : 'NNNCCn'
+        pack_st_info = 3
         pack_st_shndx = 5
         pack_st_value = 1
       else # 64
@@ -578,10 +579,9 @@ module PatchELF
         with_buf_at(shdr.sh_offset) do |buf|
           num_symbols = shdr.sh_size / sym_num_bytes
           num_symbols.times do |entry|
-            rd = buf.read(sym_num_bytes)
-            sym = rd.unpack(pack_code)
-
+            sym = buf.read(sym_num_bytes).unpack(pack_code)
             shndx = sym[pack_st_shndx]
+
             next if shndx == ELFTools::Constants::SHN_UNDEF || shndx >= ELFTools::Constants::SHN_LORESERVE
 
             if shndx >= old_sections.count
