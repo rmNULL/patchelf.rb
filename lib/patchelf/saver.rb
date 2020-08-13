@@ -342,7 +342,7 @@ module PatchELF
     end
 
     def page_size
-      PatchELF::Helper::PAGE_SIZE
+      Helper::PAGE_SIZE
     end
 
     def patch_out
@@ -435,6 +435,8 @@ module PatchELF
           dyn.d_val = find_section('.gnu.version_r').header.sh_addr.to_i
         when ELFTools::Constants::DT_VERSYM
           dyn.d_val = find_section('.gnu.version').header.sh_addr.to_i
+        else
+          next
         end
 
         with_buf_at(buf_off) { |wbuf| dyn.write(wbuf) }
@@ -482,7 +484,6 @@ module PatchELF
             raise PatchELF::PatchError, '@elf.sections[shndx] is nil' if old_sec.nil?
 
             new_index = find_section_idx old_sec.name
-
             sym[pack_st_shndx] = new_index
 
             # right 4 bits in the st_info field is st_type
@@ -575,7 +576,7 @@ module PatchELF
       needed_space = (
         ehdr.num_bytes +
         (@segments.count * seg_num_bytes) +
-        @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
+        @replaced_sections.sum { |_, str| Helper.alignup(str.size, @section_alignment) }
       )
 
       # PatchELF::Logger.info "needed space is #{needed_space}"
@@ -584,7 +585,7 @@ module PatchELF
         needed_space += seg_num_bytes # new load segment is required
         # PatchELF::Logger.info "needed space is #{needed_space}"
 
-        needed_pages = PatchELF::Helper.alignup(needed_space - start_offset, page_size) / page_size
+        needed_pages = Helper.alignup(needed_space - start_offset, page_size) / page_size
         # PatchELF::Logger.info "needed pages is #{needed_pages}"
         raise PatchELF::PatchError, 'virtual address space underrun' if needed_pages * page_size > first_page
 
@@ -609,12 +610,12 @@ module PatchELF
 
     def rewrite_sections_library
       start_page =
-        @segments.map { |seg| PatchELF::Helper.alignup(seg.header.p_vaddr + seg.header.p_memsz, page_size) }
+        @segments.map { |seg| Helper.alignup(seg.header.p_vaddr + seg.header.p_memsz, page_size) }
                  .max
 
       # PatchELF::Logger.info "Last page is 0x#{start_page.to_s 16}"
-
-      pht_size = ehdr.num_bytes + @segments.count.succ * @segments.first.header.num_bytes
+      num_notes = @sections.count { |sec| sec.header.sh_type == ELFTools::Constants::SHT_NOTE }
+      pht_size = ehdr.num_bytes + (@segments.count + 1 + num_notes) * @segments.first.header.num_bytes
       # replace sections that may overlap with expanded program header table
       @sections.each_with_index do |sec, idx|
         shdr = sec.header
@@ -624,24 +625,22 @@ module PatchELF
         replace_section sec.name, shdr.sh_size
       end
 
-      needed_space =
-        @replaced_sections.sum { |_, str| PatchELF::Helper.alignup(str.size, @section_alignment) }
+      needed_space = @replaced_sections.sum { |_, str| Helper.alignup(str.size, @section_alignment) }
       # PatchELF::Logger.info "needed space = #{needed_space}"
 
-      start_offset = PatchELF::Helper.alignup(@buffer.size, page_size)
+      start_offset = Helper.alignup(@buffer.size, page_size)
       grow_file start_offset + needed_space
 
       # executable shared object
-      if @segments.any? { |seg| seg.header.p_type == ELFTools::Constants::PT_INTERP }
-        # if start_offset > start_page
+      if start_offset > start_page && @segments.any? { |seg| seg.header.p_type == ELFTools::Constants::PT_INTERP }
         #   PatchELF::Logger.info(
         #     "shifting new PT_LOAD segment by #{start_offset - start_page} bytes to work around a Linux kernel bug"
         #   )
-        # end
         start_page = start_offset
       end
 
       ehdr.e_phnum += 1
+      ehdr.e_phoff = ehdr.num_bytes
       phdr = ELFTools::Structs::ELF_Phdr[@elf.elf_class].new(
         endian: @elf.endian,
         p_type: ELFTools::Constants::PT_LOAD,
@@ -655,6 +654,8 @@ module PatchELF
       )
       # no stream
       @segments.push ELFTools::Segments::Segment.new(phdr, nil)
+
+      normalize_note_segments!
 
       cur_off = write_replaced_sections start_offset, start_page, start_offset
       raise PatchELF::PatchError, 'cur_off /= start_offset+needed_space' if cur_off != start_offset + needed_space
@@ -797,7 +798,7 @@ module PatchELF
         if shdr.sh_type == sht_note
           shdr.sh_addralign = orig_shdr.sh_addralign.to_i if orig_shdr.sh_addralign < @section_alignment
 
-          @segments.each_with_index do |seg, j|
+          @segments.each do |seg|
             next if (phdr = seg.header).p_type != pt_note
 
             sec_range = (orig_shdr.sh_offset.to_i)...(orig_shdr.sh_offset + orig_shdr.sh_size)
@@ -813,7 +814,7 @@ module PatchELF
           end
         end
 
-        cur_off += PatchELF::Helper.alignup(rsec_data.size, @section_alignment)
+        cur_off += Helper.alignup(rsec_data.size, @section_alignment)
       end
       @replaced_sections.clear
 
