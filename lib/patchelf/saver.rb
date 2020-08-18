@@ -562,7 +562,7 @@ module PatchELF
         ehdr.e_shoff = shoff_new
         raise PatchELF::PatchError, 'ehdr.e_shnum /= @sections.size' unless ehdr.e_shnum == @sections.size
 
-        with_buf_at(e_shoff + @sections.first.header.num_bytes) do |buf| # skip writing to NULL section
+        with_buf_at(ehdr.e_shoff + @sections.first.header.num_bytes) do |buf| # skip writing to NULL section
           @sections.each_with_index do |sec, idx|
             next if idx.zero?
 
