@@ -468,10 +468,10 @@ module PatchELF
     def rewrite_sections
       return if @replaced_sections.empty?
 
-      case @elf.elf_type
-      when 'DYN'
+      case ehdr.e_type
+      when ELFTools::Constants::ET_DYN
         rewrite_sections_library
-      when 'EXEC'
+      when ELFTools::Constants::ET_EXEC
         rewrite_sections_executable
       else
         raise PatchELF::PatchError, 'unknown ELF type'
