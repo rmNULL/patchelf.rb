@@ -127,10 +127,6 @@ module PatchELF
       end
     end
 
-    def ehdr
-      @elf.header
-    end
-
     def find_section(sec_name)
       idx = find_section_idx sec_name
       return unless idx
@@ -263,26 +259,6 @@ module PatchELF
       return unless ehdr.e_type == ELFTools::Constants::ET_DYN
 
       raise NotImplementedError
-      #   shdr_dynstr = @sections.find { |s| s.name == '.dynstr' }&.header
-      #   strtab_pos = shdr_dynstr.sh_offset
-
-      #   dyn_soname = nil
-      #   each_dynamic_tags do |dyn|
-      #     dyn_soname = dyn if dyn.d_tag == ELFTools::Constants::DT_SONAME
-      #   end
-
-      #   if dyn_soname
-      #     with_buf_at(strtab_pos + dyn_soname.d_val) do |buf|
-      #       soname = []
-      #       loop do
-      #         c = buf.read 1
-      #         break if c.nil? || c == "\x00"
-
-      #         soname << c
-      #       end
-      #       PatchELF::Logger.info "soname = #{soname}"
-      #     end
-      #   end
     end
 
     def normalize_note_segments!
@@ -350,16 +326,6 @@ module PatchELF
     def patch_out
       with_buf_at(0) { |b| ehdr.write(b) }
 
-      # shoff = ehdr.e_shoff
-      # with_buf_at(shoff) do |buf|
-      #   @sections.each { |sec| sec.header.write buf }
-      # end
-
-      # phoff = ehdr.e_phoff
-      # with_buf_at(phoff) do |buf|
-      #   @segments.each { |seg| seg.header.write buf }
-      # end
-
       File.open(out_file, 'wb+') do |f|
         @buffer.rewind
         f.write @buffer.read
@@ -367,10 +333,10 @@ module PatchELF
     end
 
     # size includes NUL byte
-    def replace_section(section, size)
-      data = @replaced_sections[section]
+    def replace_section(section_name, size)
+      data = @replaced_sections[section_name]
       unless data
-        shdr = find_section(section).header
+        shdr = find_section(section_name).header
         with_buf_at(shdr.sh_offset) { |b| data = b.read shdr.sh_size }
       end
       rep_data = if data.size == size
@@ -380,7 +346,7 @@ module PatchELF
                  else
                    data[0...size] + "\x00"
                  end
-      @replaced_sections[section] = rep_data
+      @replaced_sections[section_name] = rep_data
     end
 
     def rewrite_headers(phdr_address)
@@ -393,7 +359,6 @@ module PatchELF
       end
 
       sort_phdrs!
-
       with_buf_at(ehdr.e_phoff) do |buf|
         @segments.each { |seg| seg.header.write(buf) }
       end
@@ -517,10 +482,9 @@ module PatchELF
       seg_num_bytes = @segments.first.header.num_bytes
       sort_shdrs!
 
-      # PatchELF::Logger.info @sections.first.name
-
       last_replaced = 0
       @sections.each_with_index { |sec, idx| last_replaced = idx if @replaced_sections[sec.name] }
+
       raise PatchELF::PatchError, 'last_replaced = 0' if last_replaced.zero?
       raise PatchELF::PatchError, 'last_replaced + 1 >= @sections.size' if last_replaced + 1 >= @sections.size
 
@@ -703,8 +667,6 @@ module PatchELF
       )
       # no stream
       @segments.push ELFTools::Segments::Segment.new(phdr, nil)
-
-      with_buf_at(0) { |b| ehdr.write(b) }
     end
 
     def sort_phdrs!
