@@ -93,12 +93,10 @@ module PatchELF
     end
 
     def buf_move!(dst_idx, src_idx, n_bytes)
-      with_buf_at(0) do |buf|
-        tmp = buf.read
-        tmp[dst_idx...(dst_idx + n_bytes)] = tmp[src_idx...(src_idx + n_bytes)]
-        buf.truncate 0
-        buf.rewind
-        buf.write tmp
+      with_buf_at(src_idx) do |buf|
+        to_write = buf.read(n_bytes)
+        buf.seek dst_idx
+        buf.write to_write
       end
     end
 
