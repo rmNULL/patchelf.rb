@@ -769,6 +769,7 @@ module PatchELF
         with_buf_at(shdr.sh_offset) { |b| b.write('X' * shdr.sh_size) } if shdr.sh_type != sht_no_bits
       end
 
+      noted_segments = Set.new
       # the sort is necessary, the strategy in ruby and Cpp to iterate map/hash
       # is different, patchelf v0.10 iterates the replaced_sections sorted by
       # keys.
@@ -798,16 +799,17 @@ module PatchELF
         if shdr.sh_type == sht_note
           shdr.sh_addralign = orig_shdr.sh_addralign.to_i if orig_shdr.sh_addralign < @section_alignment
 
-          @segments.each do |seg|
-            next if (phdr = seg.header).p_type != pt_note
+          @segments.each_with_index do |seg, seg_idx|
+            next if (phdr = seg.header).p_type != pt_note || noted_segments.member?(seg_idx)
 
             sec_range = (orig_shdr.sh_offset.to_i)...(orig_shdr.sh_offset + orig_shdr.sh_size)
             seg_range = (phdr.p_offset.to_i)...(phdr.p_offset + phdr.p_filesz)
 
-            next unless seg_range.cover?(sec_range)
+            next unless seg_range.cover?(sec_range.first) || seg_range.cover?(*sec_range.last(1))
 
             raise PatchELF::PatchError, 'unsupported overlap of SHT_NOTE and PT_NOTE' if seg_range != sec_range
 
+            noted_segments.add(seg_idx)
             phdr.p_offset = shdr.sh_offset.to_i
             phdr.p_paddr = phdr.p_vaddr = shdr.sh_addr.to_i
             phdr.p_filesz = phdr.p_memsz = shdr.sh_size.to_i
