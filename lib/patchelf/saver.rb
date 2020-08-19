@@ -48,18 +48,20 @@ module PatchELF
       @in_file = in_file
       @out_file = out_file
       @set = set
+
       f = File.open(in_file, 'rb+')
       @elf = ELFTools::ELFFile.new(f)
       @buffer = StringIO.new(f.tap(&:rewind).read) # StringIO makes easier to work with Bindata
 
-      @section_alignment = ehdr.e_phoff.num_bytes
-
+      @ehdr = @elf.header
       @segments = @elf.segments # usage similar to phdrs
       @sections = @elf.sections # usage similar to shdrs
       update_section_idx!
+
       # {String => String}
       # section name to its data mapping
       @replaced_sections = {}
+      @section_alignment = ehdr.e_phoff.num_bytes
     end
 
     # @return [void]
@@ -74,6 +76,8 @@ module PatchELF
     end
 
     private
+
+    attr_reader :ehdr
 
     def buf_cstr(off)
       cstr = []
