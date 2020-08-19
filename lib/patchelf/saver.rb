@@ -176,6 +176,7 @@ module PatchELF
       dt_null_idx = 0
       rpath_off = nil
       dyn_buf_off = {}
+
       each_dynamic_tags do |dyn, off|
         case dyn.d_tag
         when ELFTools::Constants::DT_RPATH
@@ -196,20 +197,34 @@ module PatchELF
         dt_null_idx += 1
       end
       old_rpath = rpath_off ? buf_cstr(rpath_off) : ''
-      return if old_rpath == new_rpath
 
+      modified_d_tag = nil
       if !force_rpath && dyn_rpath && dyn_runpath.nil?
         dyn_rpath.d_tag = ELFTools::Constants::DT_RUNPATH
         dyn_runpath = dyn_rpath
         dyn_rpath = nil
         dyn_buf_off[:runpath] = dyn_buf_off[:rpath]
         dyn_buf_off.delete :rpath
+
+        modified_d_tag = :runpath
       elsif force_rpath && dyn_runpath
         dyn_runpath.d_tag = ELFTools::Constants::DT_RPATH
         dyn_rpath = dyn_runpath
         dyn_runpath = nil
         dyn_buf_off[:rpath] = dyn_buf_off[:runpath]
         dyn_buf_off.delete :runpath
+
+        modified_d_tag = :rpath
+      end
+
+      if old_rpath == new_rpath
+        if modified_d_tag
+          dyn_offset = dyn_buf_off[modified_d_tag]
+          dyn = dyn_runpath || dyn_rpath # ugh!
+          with_buf_at(dyn_offset) { |buf| dyn.write(buf) }
+        end
+
+        return
       end
 
       with_buf_at(rpath_off) { |b| b.write('X' * old_rpath.size) } if rpath_off
